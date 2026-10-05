@@ -1,0 +1,31 @@
+# ---- 编译产物 ----
+# dist/ 可由 build.ps1 重新生成，不纳入版本控制。
+# 需要分发时直接编译，或从 Release 附件获取。
+dist/
+
+# ---- 临时与诊断产物 ----
+# temp/ 存放实测脚本、内核头文件、抓取的网页等调查资料（约 51 MB），
+# 属于过程性产物而非项目源码，不纳入版本控制。
+temp/
+
+# ---- 编译中间产物 ----
+*.obj
+*.pdb
+*.user
+*.suo
+*.cache
+
+# ---- 编辑器与系统 ----
+.vs/
+.vscode/
+*.swp
+*~
+Thumbs.db
+desktop.ini
+
+# ---- 运行时生成的文件 ----
+# 这些文件的实际位置在 %APPDATA%\MemReclaim\，此处仅作兜底，
+# 以防有人把程序放在项目目录下直接运行。
+MemReclaim.config.xml
+MemReclaim.log
+MemReclaim.selftest.txt
