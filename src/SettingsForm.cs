@@ -50,6 +50,15 @@ namespace MemReclaim
         private CheckBox _chkAutoStart;
         private CheckBox _chkNotify;
 
+        // 三个操作按钮的引用：异步清理期间需要禁用它们，
+        // 避免用户重复点击导致请求被互斥拒绝（或误以为程序卡死）。
+        private Button _btnSelfTest;
+        private Button _btnClean;
+        private Button _btnCombine;
+
+        /// <summary>本次异步操作的类型。只由 UI 线程读写。</summary>
+        private PendingKind _pendingKind = PendingKind.None;
+
         private Label _statusLabel;
         private TextBox _logBox;
 
@@ -159,6 +168,9 @@ namespace MemReclaim
             RefreshStatus();
 
             _engine.StateUpdated += OnState;
+            // 异步清理完成后回报结果。清理在后台线程执行，
+            // OnCleaned 内部会切回 UI 线程再更新控件。
+            _engine.Cleaned += OnCleaned;
         }
 
         /// <summary>把 96 DPI 设计值换算为当前 DPI 下的像素值。</summary>
@@ -368,6 +380,7 @@ namespace MemReclaim
             btnTest.Size = Sz(88, 28);
             btnTest.Click += delegate { RunSelfTest(); };
             Controls.Add(btnTest);
+            _btnSelfTest = btnTest;
 
             Button btnClean = new Button();
             btnClean.Text = "立即清理";
@@ -375,6 +388,7 @@ namespace MemReclaim
             btnClean.Size = Sz(88, 28);
             btnClean.Click += delegate { ManualClean(); };
             Controls.Add(btnClean);
+            _btnClean = btnClean;
 
             // 单独的手动合并按钮：合并开销高于其他清理项，
             // 且与「立即清理」用途不同（后者做全套），故独立成键。
@@ -384,6 +398,7 @@ namespace MemReclaim
             btnCombine.Size = Sz(96, 28);
             btnCombine.Click += delegate { ManualCombine(); };
             Controls.Add(btnCombine);
+            _btnCombine = btnCombine;
 
             Button btnSave = new Button();
             btnSave.Text = "保存";
@@ -485,6 +500,64 @@ namespace MemReclaim
                 RefreshStatus(st);
             }
             catch { }
+        }
+
+        /// <summary>
+        /// 异步清理完成后的回调。
+        ///
+        /// 清理在后台线程执行，这里必须切回 UI 线程才能碰控件。
+        /// 结果展示方式由 _pendingKind 决定——因为异步化之后，
+        /// 发起清理的地方已经拿不到结果列表了。
+        /// </summary>
+        private void OnCleaned(List<CleanResult> results)
+        {
+            if (IsDisposed) return;
+            try
+            {
+                if (InvokeRequired)
+                {
+                    BeginInvoke(new Action<List<CleanResult>>(OnCleaned), results);
+                    return;
+                }
+
+                PendingKind kind = _pendingKind;
+                _pendingKind = PendingKind.None;
+
+                SetButtonsEnabled(true);
+                Cursor = Cursors.Default;
+
+                if (kind == PendingKind.None) return;   // 自动触发：不打扰
+
+                StringBuilder sb = new StringBuilder();
+                sb.AppendLine(kind == PendingKind.Clean ? "手动清理" : "手动合并内存页");
+                sb.AppendLine("时间：" + DateTime.Now.ToString("HH:mm:ss"));
+                sb.AppendLine();
+
+                long freed = 0;
+                foreach (CleanResult r in results)
+                {
+                    sb.AppendLine(r.ToString());
+                    freed += r.BytesFreed;
+                }
+                if (kind == PendingKind.Clean)
+                    sb.AppendLine("合计释放（估算）：" + MemoryState.FormatBytes(freed));
+
+                _logBox.Text = sb.ToString();
+                RefreshStatus();
+            }
+            catch { }
+        }
+
+        /// <summary>本次异步操作的类型，决定结果如何展示。</summary>
+        private enum PendingKind { None, Clean, Combine }
+
+        /// <summary>禁用三个操作按钮，避免清理进行中重复点击。</summary>
+        private void SetButtonsEnabled(bool enabled)
+        {
+            if (_btnClean != null) _btnClean.Enabled = enabled;
+            if (_btnCombine != null) _btnCombine.Enabled = enabled;
+            if (_btnSelfTest != null) _btnSelfTest.Enabled = enabled;
+            UseWaitCursor = !enabled;
         }
 
         private void RefreshStatus() { RefreshStatus(MemoryStateReader.Read()); }
@@ -602,33 +675,25 @@ namespace MemReclaim
             RefreshStatus();
         }
 
+        /// <summary>
+        /// 手动「立即清理」。
+        ///
+        /// 异步执行：清理在后台线程完成，界面不会冻结——
+        /// 内存压力极大时单次清理可能耗时数秒，同步执行会让窗口显示「无响应」。
+        /// 结果由 OnCleaned 回调展示。
+        /// </summary>
         private void ManualClean()
         {
-            Cursor = Cursors.WaitCursor;
-            List<CleanResult> results;
-            try
-            {
-                results = _engine.CleanNow(true);
-            }
-            finally
-            {
-                Cursor = Cursors.Default;
-            }
+            _pendingKind = PendingKind.Clean;
+            SetButtonsEnabled(false);
 
-            StringBuilder sb = new StringBuilder();
-            sb.AppendLine("手动清理");
-            sb.AppendLine("时间：" + DateTime.Now.ToString("HH:mm:ss"));
-            sb.AppendLine();
-
-            long freed = 0;
-            foreach (CleanResult r in results)
+            if (!_engine.CleanNowAsync(true))
             {
-                sb.AppendLine(r.ToString());
-                freed += r.BytesFreed;
+                // 上一次清理还在进行中，本次请求被拒绝
+                _pendingKind = PendingKind.None;
+                SetButtonsEnabled(true);
+                _logBox.Text = "上一次清理仍在进行中，请稍候再试。";
             }
-            sb.AppendLine("合计释放（估算）：" + MemoryState.FormatBytes(freed));
-            _logBox.Text = sb.ToString();
-            RefreshStatus();
         }
 
         /// <summary>
@@ -637,10 +702,13 @@ namespace MemReclaim
         /// 与「立即清理」的区别：这里只做合并这一项，不触发其他清理。
         /// 也不受「清理项目」中合并复选框的约束——用户既然点了这个按钮，
         /// 意图就是执行合并，与是否纳入自动策略无关。
+        ///
+        /// 同样是异步执行，理由见 ManualClean。
         /// </summary>
         private void ManualCombine()
         {
-            // 合并需要 SeProfileSingleProcessPrivilege，先确保已启用
+            // 合并需要 SeProfileSingleProcessPrivilege，先确保已启用。
+            // 这一步很快（只是 AdjustTokenPrivileges），留在 UI 线程无妨。
             var priv = Privileges.Enable(Privileges.SeProfileSingleProcess);
             if (!priv.Enabled)
             {
@@ -659,35 +727,15 @@ namespace MemReclaim
                 return;
             }
 
-            Cursor = Cursors.WaitCursor;
-            CleanResult r;
-            try
-            {
-                List<CleanResult> rs = _engine.CombineNow();
-                r = (rs != null && rs.Count > 0) ? rs[0] : new CleanResult();
-            }
-            finally
-            {
-                Cursor = Cursors.Default;
-            }
+            _pendingKind = PendingKind.Combine;
+            SetButtonsEnabled(false);
 
-            StringBuilder sb = new StringBuilder();
-            sb.AppendLine("手动合并内存页");
-            sb.AppendLine("时间：" + DateTime.Now.ToString("HH:mm:ss"));
-            sb.AppendLine();
-            sb.AppendLine(r.Success ? "结果：成功" : "结果：失败");
-            sb.AppendLine("说明：" + r.Message);
-
-            if (r.Success)
+            if (!_engine.CombineNowAsync())
             {
-                if (r.BytesFreed > 0)
-                    sb.AppendLine("合并页数折算：" + MemoryState.FormatBytes(r.BytesFreed));
-                else
-                    sb.AppendLine("本次没有找到可合并的重复页面——这属正常情况，不是故障。");
+                _pendingKind = PendingKind.None;
+                SetButtonsEnabled(true);
+                _logBox.Text = "上一次操作仍在进行中，请稍候再试。";
             }
-
-            _logBox.Text = sb.ToString();
-            RefreshStatus();
         }
 
         private void SaveAndClose()
@@ -725,6 +773,7 @@ namespace MemReclaim
         protected override void OnFormClosed(FormClosedEventArgs e)
         {
             _engine.StateUpdated -= OnState;
+            _engine.Cleaned -= OnCleaned;
             base.OnFormClosed(e);
         }
     }

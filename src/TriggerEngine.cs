@@ -169,29 +169,105 @@ namespace MemReclaim
             }
         }
 
-        /// <summary>手动触发（托盘菜单点击），忽略阈值与冷却。</summary>
-        public List<CleanResult> CleanNow(bool includeCombine)
+        /// <summary>
+        /// 手动触发（托盘菜单 / 设置界面按钮）。忽略阈值与冷却。
+        ///
+        /// **本方法不阻塞调用线程**：清理动作在后台线程执行，完成后通过
+        /// Cleaned 事件回报。UI 线程因此不会被 NtSetSystemInformation 冻住——
+        /// 内存压力极大时单次清理可能耗时数秒，同步执行会让窗口呈现「无响应」。
+        ///
+        /// 完成后回调可能来自后台线程，订阅方需自行切回 UI 线程
+        /// （见 TrayApp.OnCleaned / SettingsForm.OnCleaned）。
+        ///
+        /// 返回 false 表示已有清理在进行中，本次请求被忽略——
+        /// 这样手动操作与自动触发共享同一把锁，不会并发调用内核接口。
+        /// </summary>
+        public bool CleanNowAsync(bool includeCombine)
         {
-            List<CleanResult> results = RunCleanCore(includeCombine);
-
+            // 与自动触发路径共用 _busy：两者都调用 NtSetSystemInformation，
+            // 并发执行既无意义也可能相互干扰，必须互斥。
             lock (_sync)
             {
-                _lastClean = DateTime.Now;
-                if (includeCombine) _lastCombine = DateTime.Now;
+                if (_busy) return false;
+                _busy = true;
             }
 
-            Report(results);
-            return results;
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                try
+                {
+                    List<CleanResult> results = RunCleanCore(includeCombine);
+
+                    lock (_sync)
+                    {
+                        _lastClean = DateTime.Now;
+                        if (includeCombine) _lastCombine = DateTime.Now;
+                    }
+
+                    Report(results);
+                }
+                catch (Exception ex)
+                {
+                    // 后台线程里未捕获的异常会终止进程，必须兜住。
+                    // 以一条失败结果回报，让界面能显示出来。
+                    List<CleanResult> err = new List<CleanResult>();
+                    CleanResult r = new CleanResult();
+                    r.Item = "清理";
+                    r.Executed = true;
+                    r.Success = false;
+                    r.Message = "后台执行异常：" + ex.Message;
+                    err.Add(r);
+                    Report(err);
+                }
+                finally
+                {
+                    lock (_sync) _busy = false;
+                }
+            });
+
+            return true;
         }
 
-        /// <summary>仅合并内存列表（手动按钮调用）。</summary>
-        public List<CleanResult> CombineNow()
+        /// <summary>
+        /// 仅合并内存列表（手动按钮调用）。与 CleanNowAsync 同样异步、同样互斥。
+        /// </summary>
+        public bool CombineNowAsync()
         {
-            List<CleanResult> results = new List<CleanResult>();
-            results.Add(MemoryCleaner.CombineMemoryLists());
-            lock (_sync) _lastCombine = DateTime.Now;
-            Report(results);
-            return results;
+            lock (_sync)
+            {
+                if (_busy) return false;
+                _busy = true;
+            }
+
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                try
+                {
+                    List<CleanResult> results = new List<CleanResult>();
+                    results.Add(MemoryCleaner.CombineMemoryLists());
+
+                    lock (_sync) _lastCombine = DateTime.Now;
+
+                    Report(results);
+                }
+                catch (Exception ex)
+                {
+                    List<CleanResult> err = new List<CleanResult>();
+                    CleanResult r = new CleanResult();
+                    r.Item = "合并内存列表";
+                    r.Executed = true;
+                    r.Success = false;
+                    r.Message = "后台执行异常：" + ex.Message;
+                    err.Add(r);
+                    Report(err);
+                }
+                finally
+                {
+                    lock (_sync) _busy = false;
+                }
+            });
+
+            return true;
         }
 
         private void RunClean()

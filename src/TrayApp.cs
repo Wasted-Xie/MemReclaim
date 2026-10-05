@@ -21,6 +21,15 @@ namespace MemReclaim
         private bool _lastPrivilegeOk;
         private IntegrityLevel _integrityLevel = IntegrityLevel.Unknown;
 
+        /// <summary>
+        /// 下一次 Cleaned 回调是否要用对话框展示结果。
+        ///
+        /// 异步化后 ManualClean() 无法直接拿到结果列表，改为在这里留标记，
+        /// 由 OnCleaned 读取。用 Interlocked 风格的简单赋值即可：
+        /// 只可能被 UI 线程写、被后台线程读一次，最坏情况是漏弹一次对话框。
+        /// </summary>
+        private volatile bool _showResultDialog;
+
         public TrayApp()
         {
             _config = Config.Load();
@@ -160,6 +169,23 @@ namespace MemReclaim
 
         private void OnCleaned(List<CleanResult> results)
         {
+            // 该回调可能来自后台线程（CleanNowAsync / CombineNowAsync 在线程池
+            // 执行清理后回报），也可能是自动触发的定时器线程。
+            // NotifyIcon 属于 UI 线程，直接操作会抛跨线程异常。
+            if (_icon == null) return;
+            try
+            {
+                if (_icon.ContextMenuStrip != null && _icon.ContextMenuStrip.InvokeRequired)
+                {
+                    _icon.ContextMenuStrip.BeginInvoke(new Action<List<CleanResult>>(OnCleaned), results);
+                    return;
+                }
+            }
+            catch
+            {
+                return;   // 句柄已销毁等：放弃本次界面更新
+            }
+
             int ok = 0, fail = 0;
             long freed = 0;
             string firstFailure = null;
@@ -175,6 +201,17 @@ namespace MemReclaim
                 }
                 freed += r.BytesFreed;
                 sb.AppendLine(r.ToString());
+            }
+
+            // 手动点击「立即清理」时用户期待看到完整结果，用对话框呈现；
+            // 自动触发只弹气泡，避免频繁打扰。
+            bool showDialog = _showResultDialog;
+            _showResultDialog = false;
+
+            if (showDialog)
+            {
+                ShowResultDialog(results);
+                return;
             }
 
             // 通知关闭时成功保持静默；但失败必须告知，
@@ -204,12 +241,27 @@ namespace MemReclaim
             catch { }
         }
 
+        /// <summary>
+        /// 托盘菜单「立即清理」。
+        ///
+        /// 异步执行：清理在后台线程完成，界面不会冻结。
+        /// 结果由 OnCleaned 事件回来后再弹结果对话框——
+        /// 因此这里不再直接拿到 List&lt;CleanResult&gt;。
+        /// </summary>
         private void ManualClean()
         {
             CheckPrivileges(false);
+
+            // 标记本次结果需要以对话框展示（自动触发只弹气泡，不打扰）
+            _showResultDialog = true;
+
             // Combine 手动执行时一并做，用户点了就期望全清一遍
-            List<CleanResult> r = _engine.CleanNow(true);
-            ShowResultDialog(r);
+            if (!_engine.CleanNowAsync(true))
+            {
+                _showResultDialog = false;
+                MessageBox.Show("上一次清理仍在进行中，请稍候再试。",
+                    "内存回收", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
         }
 
         private void ShowResultDialog(List<CleanResult> results)
