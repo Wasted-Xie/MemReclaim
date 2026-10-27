@@ -35,6 +35,16 @@ namespace MemReclaim
             _config = Config.Load();
             _config.Elevated = SelfTest.IsElevated();
 
+            // 开机自启的状态以「shell:startup 里是否有指向本程序的快捷方式」为准。
+            // Config.Load() 已经把 AutoStart 覆盖成实际状态，这里再把偏差写回配置：
+            // 否则 XML 里会一直留着 AutoStart=true，而实际开机并不启动，
+            // 下次排查时会被这份过期记录误导。
+            ReconcileAutoStart();
+
+            // 清掉旧版留在注册表 Run 项里的自启条目。不做的话，从旧版升级上来的
+            // 机器会同时存在两处自启，开机启动两个实例（第二个会被互斥锁拦下）。
+            AutoStart.CleanupLegacy();
+
             // ---- 托盘菜单 ----
             ContextMenuStrip menu = new ContextMenuStrip();
 
@@ -88,6 +98,29 @@ namespace MemReclaim
                     : "缺少必要特权，清理可能失败。请以管理员身份运行，详见设置窗口。";
                 _icon.ShowBalloonTip(3000);
             }
+        }
+
+        /// <summary>
+        /// 启动时校正开机自启状态。
+        ///
+        /// 判据只有一个：启动文件夹（shell:startup）里是否存在指向本 exe 的快捷方式。
+        /// 用户可能绕过本程序直接删掉那个快捷方式，或把程序挪到别的目录导致快捷方式
+        /// 指向失效。这两种情况下配置里残留的 true 都不再成立，必须落盘修正，
+        /// 否则设置界面会显示「已勾选」而开机实际不启动。
+        /// </summary>
+        private void ReconcileAutoStart()
+        {
+            if (_config.AutoStart == _config.AutoStartConfigured) return;
+
+            // 配置记录与实际不一致：以实际为准，并把结果写回配置文件。
+            _config.Save();
+
+            // 不弹通知：用户主动删快捷方式时本就知道自己在做什么，
+            // 启动时再弹一次属于打扰。状态在设置界面里可见即可。
+            Storage.AppendLog(
+                "开机自启状态已校正：配置记录 " + (_config.AutoStartConfigured ? "已启用" : "未启用") +
+                "，实际 " + (_config.AutoStart ? "已启用" : "未启用") +
+                "（判据：" + AutoStart.StartupFolder + "）" + Environment.NewLine);
         }
 
         /// <summary>

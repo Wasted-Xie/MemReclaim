@@ -1,5 +1,6 @@
 using System;
 using System.Runtime.InteropServices;
+using System.Text;
 
 namespace MemReclaim
 {
@@ -69,6 +70,18 @@ namespace MemReclaim
 
         [DllImport("kernel32.dll", SetLastError = true)]
         public static extern bool GlobalMemoryStatusEx(ref MEMORYSTATUSEX status);
+
+        /// <summary>
+        /// 把 8.3 短路径展开成长路径。
+        /// 用途：Application.ExecutablePath 在部分启动方式下返回 C:\Users\ADMINI~1\...，
+        /// 而快捷方式里存的是长路径，比较前必须统一形态，否则会误判为「不是本程序」。
+        /// </summary>
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern uint GetLongPathName(string shortPath, StringBuilder longPath, uint bufferLength);
+
+        /// <summary>把路径转成 8.3 短名形式（仅诊断/测试用）。</summary>
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern uint GetShortPathName(string longPath, StringBuilder shortPath, uint bufferLength);
 
         [StructLayout(LayoutKind.Sequential)]
         public struct MEMORYSTATUSEX

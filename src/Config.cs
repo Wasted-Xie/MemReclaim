@@ -62,6 +62,17 @@ namespace MemReclaim
         public bool AutoStart = false;
 
         /// <summary>
+        /// 配置文件里原本记录的自启状态（加载时的原始值）。
+        ///
+        /// AutoStart 在 Load() 中会被启动文件夹的实际状态覆盖，覆盖之后就看不出
+        /// 「配置文件说已启用、实际却没有快捷方式」这种偏差了。保留原值是为了让
+        /// 程序启动时能判断是否需要回写修正——只改内存不落盘的话，XML 里会一直
+        /// 残留 true，日后排查时会误导。
+        /// </summary>
+        [XmlIgnore]
+        public bool AutoStartConfigured = false;
+
+        /// <summary>
         /// 是否在清理后弹出托盘气泡通知。默认关闭——
         /// 自动清理是后台行为，频繁弹窗会打扰使用；需要时可在设置里开启。
         /// 注意：这不影响「权限不足」等异常提示，那些仍会显示，
@@ -110,8 +121,13 @@ namespace MemReclaim
             if (c == null) c = new Config();
             c.Normalize();
 
-            // AutoStart 以注册表实际状态为准：用户可能在任务管理器里手动禁用过启动项，
-            // 若只信配置文件，界面会显示错误的状态。
+            // 先记下配置文件里的原始值，再以实际状态覆盖。
+            c.AutoStartConfigured = c.AutoStart;
+
+            // AutoStart 以启动文件夹的实际状态为准：判据是「shell:startup 里是否存在
+            // 指向本 exe 的快捷方式」。用户手动删掉快捷方式、或程序被移动到别处导致
+            // 快捷方式指向失效时，这里会得到 false，界面随即显示为未勾选。
+            // 若只信配置文件，界面会显示一个开机实际不会生效的勾选状态。
             // 注意用完全限定名：本类的 AutoStart 字段会遮蔽同名的静态类。
             c.AutoStart = MemReclaim.AutoStart.IsEnabled();
 

@@ -758,12 +758,28 @@ namespace MemReclaim
 
             _config.ShowNotifications = _chkNotify.Checked;
 
-            // 开机自启：写注册表 Run 项，不需要管理员权限，
-            // 因此可以和其它设置一起在「保存」时统一生效。
+            // 开机自启：在启动文件夹（shell:startup）创建/删除指向本程序的快捷方式，
+            // 不需要管理员权限，因此可以和其它设置一起在「保存」时统一生效。
             if (_chkAutoStart.Checked != _config.AutoStart)
             {
-                _config.AutoStart = _chkAutoStart.Checked;
-                AutoStart.Apply(_config.AutoStart);
+                bool want = _chkAutoStart.Checked;
+                bool ok = AutoStart.Apply(want);
+
+                // 以实际状态为准，不直接采用用户的期望值：
+                // 快捷方式创建失败（目录只读、磁盘满等）时若写入 true，
+                // 界面会显示已启用，但开机实际不会启动。
+                _config.AutoStart = MemReclaim.AutoStart.IsEnabled();
+
+                if (!ok || _config.AutoStart != want)
+                {
+                    _config.AutoStart = false;
+                    _chkAutoStart.Checked = false;
+                    MessageBox.Show(
+                        "无法修改开机自启设置。\n\n" +
+                        "启动文件夹：" + AutoStart.StartupFolder + "\n\n" +
+                        "请确认该目录可写，或手动把 MemReclaim 的快捷方式放入该目录。",
+                        "内存回收", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                }
             }
 
             _app.ApplyConfig();
