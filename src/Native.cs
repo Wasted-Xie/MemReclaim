@@ -83,6 +83,94 @@ namespace MemReclaim
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         public static extern uint GetShortPathName(string longPath, StringBuilder shortPath, uint bufferLength);
 
+        // ---------- 工作集修剪 / 进程枚举 ----------
+        public const uint PROCESS_QUERY_INFORMATION = 0x0400;
+        public const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
+        public const uint PROCESS_SET_QUOTA = 0x0100;
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern IntPtr OpenProcess(uint access,
+            [MarshalAs(UnmanagedType.Bool)] bool inherit, int processId);
+
+        /// <summary>
+        /// 清空指定进程的工作集（页面转入待机/已修改列表）。
+        /// 文档要求的访问权限为 PROCESS_QUERY_INFORMATION | PROCESS_SET_QUOTA。
+        /// </summary>
+        [DllImport("psapi.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool EmptyWorkingSet(IntPtr hProcess);
+
+        /// <summary>取进程的包标识（UWP/Store 应用）；无包时返回 APPMODEL_ERROR_NO_PACKAGE。</summary>
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern int GetPackageFullName(IntPtr hProcess, ref uint packageFullNameLength,
+            StringBuilder packageFullName);
+
+        public const int APPMODEL_ERROR_NO_PACKAGE = 15700;
+        public const int ERROR_INSUFFICIENT_BUFFER_CODE = 122;
+
+        // ---------- 令牌 → 账户名 ----------
+        public const int TokenUserClass = 1;
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool GetTokenInformation(IntPtr token, int infoClass, IntPtr info,
+            int length, out int returnLength);
+
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool LookupAccountSid(string systemName, IntPtr sid,
+            StringBuilder name, ref int nameLength,
+            StringBuilder domainName, ref int domainNameLength, out int use);
+
+        // ---------- 窗口枚举（判定前台应用） ----------
+        public const int GWL_EXSTYLE = -20;
+        public const int WS_EX_TOOLWINDOW = 0x00000080;
+        public const uint GW_OWNER = 4;
+
+        public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool EnumWindows(EnumWindowsProc callback, IntPtr lParam);
+
+        [DllImport("user32.dll")]
+        public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out int processId);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool IsWindowVisible(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        public static extern IntPtr GetWindow(IntPtr hWnd, uint command);
+
+        [DllImport("user32.dll", EntryPoint = "GetWindowLongW")]
+        public static extern int GetWindowLong(IntPtr hWnd, int index);
+
+        /// <summary>取当前拥有焦点的窗口句柄；无焦点时为 IntPtr.Zero。</summary>
+        [DllImport("user32.dll")]
+        public static extern IntPtr GetForegroundWindow();
+
+        // ---------- 焦点切换事件 ----------
+        // 用 SetWinEventHook 监听 EVENT_SYSTEM_FOREGROUND，比定时轮询实时得多：
+        // 用户点一下别的窗口就立刻触发，而轮询最快也要等一个间隔。
+        public const uint EVENT_SYSTEM_FOREGROUND = 0x0003;
+        /// <summary>回调在安装钩子的线程的消息循环里执行。</summary>
+        public const uint WINEVENT_OUTOFCONTEXT = 0x0000;
+        /// <summary>忽略本进程自己产生的事件。</summary>
+        public const uint WINEVENT_SKIPOWNPROCESS = 0x0002;
+
+        public delegate void WinEventDelegate(IntPtr hWinEventHook, uint eventType, IntPtr hwnd,
+            int idObject, int idChild, uint dwEventThread, uint dwmsEventTime);
+
+        [DllImport("user32.dll")]
+        public static extern IntPtr SetWinEventHook(uint eventMin, uint eventMax,
+            IntPtr hmodWinEventProc, WinEventDelegate lpfnWinEventProc,
+            uint idProcess, uint idThread, uint dwFlags);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool UnhookWinEvent(IntPtr hWinEventHook);
+
         [StructLayout(LayoutKind.Sequential)]
         public struct MEMORYSTATUSEX
         {

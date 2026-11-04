@@ -50,29 +50,42 @@ namespace MemReclaim
         private CheckBox _chkAutoStart;
         private CheckBox _chkNotify;
 
+        // ---- 工作集修剪 ----
+        private CheckBox _chkTrim;
+        private NumericUpDown _trimThreads;
+        private NumericUpDown _trimThreshold;
+        private NumericUpDown _trimCooldown;
+        private CheckBox _chkTrimBackground;
+        private CheckBox _chkTrimWindowsProc;
+        private Label _lblTrimSummary;
+        private Button _btnProcessList;
+
         // 三个操作按钮的引用：异步清理期间需要禁用它们，
         // 避免用户重复点击导致请求被互斥拒绝（或误以为程序卡死）。
         private Button _btnSelfTest;
         private Button _btnClean;
         private Button _btnCombine;
+        private Button _btnTrim;
 
         /// <summary>本次异步操作的类型。只由 UI 线程读写。</summary>
         private PendingKind _pendingKind = PendingKind.None;
+
+        /// <summary>本次修剪是否由用户手动发起（决定结果是否弹到日志区）。</summary>
+        private bool _pendingTrim;
 
         private Label _statusLabel;
         private TextBox _logBox;
 
         // ---- 96 DPI 下的设计尺寸 ----
         // 高度须容纳所有内容。逐项累加的实际结果：
-        //   模式组 12..170 → 清理组 178..352 → 其它组 360..440
-        //   → 状态 448..514 → 日志 520..600 → 按钮 608..636
-        // 故设计高度不得低于 636。取 648 留出 12px 底部留白。
-        // 窗口总高 = 648*1.5 + 标题栏 23 + 边框 8 ≈ 1003 < 工作区 1027，可完整显示。
+        //   模式组 12..170 → 清理组 178..352 → 修剪组 360..464
+        //   → 其它组 472..560 → 状态 568..634 → 日志 640..720 → 按钮 728..756
+        // 故设计高度不得低于 756。取 768 留出底部留白。
         //
         // 注意：曾把此值压到 620，导致按钮行被窗口底边裁掉（只露出上半截）。
         // 压缩高度前务必按上面的累加方式复核。
         private const int FormW = 560;
-        private const int FormH = 648;
+        private const int FormH = 768;
         private const int Margin_ = 12;
         private const int GroupW = FormW - Margin_ * 2;   // 536
 
@@ -161,7 +174,28 @@ namespace MemReclaim
             MinimizeBox = false;
             StartPosition = FormStartPosition.CenterScreen;
             Font = new Font("Microsoft YaHei UI", 9f);
-            ClientSize = new Size(S(FormW), S(FormH));
+
+            // 内容高度换算成实际像素后可能超出工作区（例如 150% 缩放时
+            // 768*1.5=1152，而 1080p 的工作区只有 ~1027）。此时若不处理，
+            // 底部按钮会被窗口底边裁掉——历史上就踩过这个坑。
+            // 因此按工作区夹取高度，并按需开启滚动：宁可滚动条出现，
+            // 也不能让「保存」按钮点不到。
+            int designW = S(FormW);
+            int designH = S(FormH);
+            Rectangle work = Screen.PrimaryScreen.WorkingArea;
+            int maxH = work.Height - S(48);      // 预留标题栏与边框
+            int w = designW;
+            int h = designH;
+
+            if (h > maxH)
+            {
+                h = maxH;
+                AutoScroll = true;
+                // 竖向滚动条会占掉客户区宽度，补上它以免出现横向滚动条
+                w += SystemInformation.VerticalScrollBarWidth;
+            }
+
+            ClientSize = new Size(w, h);
 
             BuildUi();
             LoadFromConfig();
@@ -171,6 +205,8 @@ namespace MemReclaim
             // 异步清理完成后回报结果。清理在后台线程执行，
             // OnCleaned 内部会切回 UI 线程再更新控件。
             _engine.Cleaned += OnCleaned;
+            _engine.Trimmed += OnTrimmed;
+            _engine.TrimProgress += OnTrimProgress;
         }
 
         /// <summary>把 96 DPI 设计值换算为当前 DPI 下的像素值。</summary>
@@ -329,6 +365,114 @@ namespace MemReclaim
 
             y += 182;
 
+            // ================= 工作集修剪 =================
+            // 与「清理项目」同层级但独立成组：上面四项作用于系统级内存列表，
+            // 这一项作用于具体进程的工作集，触发语义与风险面都不同，
+            // 混在一个开关里会让用户无法只关其中一类。
+            GroupBox grpTrim = new GroupBox();
+            grpTrim.Text = "工作集修剪（Working Set Trim）";
+            grpTrim.Location = Pt(Margin_, y);
+            grpTrim.Size = Sz(GroupW, 104);
+            Controls.Add(grpTrim);
+
+            _chkTrim = new CheckBox();
+            _chkTrim.Text = "启用";
+            _chkTrim.AutoSize = true;
+            _chkTrim.CheckedChanged += delegate { SyncEnabled(); };
+            grpTrim.Controls.Add(_chkTrim);
+            _chkTrim.Location = Pt(14, 21);
+
+            // 以下横坐标一律由前一个控件的 Right 递推。
+            // 写死坐标会算错中文标签宽度：「并行线程数：」实际约 84px，
+            // 之前数字框放在 160 而标签占到 164，数字框左缘被压住，
+            // 界面上只剩半个数字。
+            Label lblTrimThreads = new Label();
+            lblTrimThreads.Text = "并行线程数：";
+            lblTrimThreads.AutoSize = true;
+            grpTrim.Controls.Add(lblTrimThreads);
+            lblTrimThreads.Location = new Point(_chkTrim.Right + S(12), S(24));
+
+            _trimThreads = new NumericUpDown();
+            _trimThreads.Size = Sz(56, 23);
+            _trimThreads.Minimum = 1;
+            _trimThreads.Maximum = 32;
+            grpTrim.Controls.Add(_trimThreads);
+            _trimThreads.Location = new Point(lblTrimThreads.Right + S(4), S(21));
+
+            Label lblTrimThreadsHint = new Label();
+            lblTrimThreadsHint.Text = "（1–32，进程多时可提高）";
+            lblTrimThreadsHint.AutoSize = true;
+            grpTrim.Controls.Add(lblTrimThreadsHint);
+            lblTrimThreadsHint.Location = new Point(_trimThreads.Right + S(8), S(24));
+
+            Label lblTrimOver = new Label();
+            lblTrimOver.Text = "内存占用超过";
+            lblTrimOver.AutoSize = true;
+            grpTrim.Controls.Add(lblTrimOver);
+            lblTrimOver.Location = Pt(14, 50);
+
+            _trimThreshold = new NumericUpDown();
+            _trimThreshold.Size = Sz(56, 23);
+            _trimThreshold.Minimum = 1;
+            _trimThreshold.Maximum = 99;
+            grpTrim.Controls.Add(_trimThreshold);
+            _trimThreshold.Location = new Point(lblTrimOver.Right + S(6), S(47));
+
+            Label lblTrimPct = new Label();
+            lblTrimPct.Text = "% 时自动修剪，冷却";
+            lblTrimPct.AutoSize = true;
+            grpTrim.Controls.Add(lblTrimPct);
+            lblTrimPct.Location = new Point(_trimThreshold.Right + S(8), S(50));
+
+            _trimCooldown = new NumericUpDown();
+            _trimCooldown.Size = Sz(66, 23);
+            _trimCooldown.Minimum = 0;
+            _trimCooldown.Maximum = 86400;
+            grpTrim.Controls.Add(_trimCooldown);
+            _trimCooldown.Location = new Point(lblTrimPct.Right + S(4), S(47));
+
+            Label lblTrimSec = new Label();
+            lblTrimSec.Text = "秒";
+            lblTrimSec.AutoSize = true;
+            grpTrim.Controls.Add(lblTrimSec);
+            lblTrimSec.Location = new Point(_trimCooldown.Right + S(6), S(50));
+
+            _chkTrimBackground = new CheckBox();
+            _chkTrimBackground.Text = "自动纳入后台应用";
+            _chkTrimBackground.AutoSize = true;
+            grpTrim.Controls.Add(_chkTrimBackground);
+            _chkTrimBackground.Location = Pt(14, 76);
+
+            _chkTrimWindowsProc = new CheckBox();
+            _chkTrimWindowsProc.Text = "自动纳入 Windows 进程";
+            _chkTrimWindowsProc.AutoSize = true;
+            grpTrim.Controls.Add(_chkTrimWindowsProc);
+            _chkTrimWindowsProc.Location = new Point(_chkTrimBackground.Right + S(10), S(76));
+
+            _btnProcessList = new Button();
+            _btnProcessList.Text = "进程列表…";
+            _btnProcessList.Size = Sz(92, 26);
+            _btnProcessList.Click += delegate { ShowProcessList(); };
+            grpTrim.Controls.Add(_btnProcessList);
+            _btnProcessList.Location = Pt(GroupW - 14 - 92, 72);
+
+            // 统计标签挤在两个复选框与右侧按钮之间，空间不固定。
+            // 用 AutoSize=false + AutoEllipsis：宁可显示省略号，也不能压到按钮上
+            // ——之前它是 AutoSize，文字一长就伸进按钮区域被遮住。
+            _lblTrimSummary = new Label();
+            _lblTrimSummary.AutoSize = false;
+            _lblTrimSummary.AutoEllipsis = true;
+            _lblTrimSummary.TextAlign = ContentAlignment.MiddleLeft;
+            grpTrim.Controls.Add(_lblTrimSummary);
+
+            int summaryX = _chkTrimWindowsProc.Right + S(10);
+            int summaryW = _btnProcessList.Left - S(8) - summaryX;
+            if (summaryW < S(48)) summaryW = S(48);
+            _lblTrimSummary.Location = new Point(summaryX, S(80));
+            _lblTrimSummary.Size = new Size(summaryW, S(18));
+
+            y += 112;
+
             // ================= 其它 =================
             GroupBox grpOther = new GroupBox();
             grpOther.Text = "其它";
@@ -374,18 +518,19 @@ namespace MemReclaim
             y += 88;
 
             // ================= 按钮 =================
+            // 六个按钮等距排布，总宽 528 < 可用宽度 536。
             Button btnTest = new Button();
             btnTest.Text = "检查权限";
             btnTest.Location = Pt(Margin_, y);
-            btnTest.Size = Sz(88, 28);
+            btnTest.Size = Sz(80, 28);
             btnTest.Click += delegate { RunSelfTest(); };
             Controls.Add(btnTest);
             _btnSelfTest = btnTest;
 
             Button btnClean = new Button();
             btnClean.Text = "立即清理";
-            btnClean.Location = Pt(Margin_ + 96, y);
-            btnClean.Size = Sz(88, 28);
+            btnClean.Location = Pt(Margin_ + 88, y);
+            btnClean.Size = Sz(80, 28);
             btnClean.Click += delegate { ManualClean(); };
             Controls.Add(btnClean);
             _btnClean = btnClean;
@@ -394,23 +539,34 @@ namespace MemReclaim
             // 且与「立即清理」用途不同（后者做全套），故独立成键。
             Button btnCombine = new Button();
             btnCombine.Text = "合并内存页";
-            btnCombine.Location = Pt(Margin_ + 192, y);
-            btnCombine.Size = Sz(96, 28);
+            btnCombine.Location = Pt(Margin_ + 176, y);
+            btnCombine.Size = Sz(88, 28);
             btnCombine.Click += delegate { ManualCombine(); };
             Controls.Add(btnCombine);
             _btnCombine = btnCombine;
 
+            // 修剪工作集：与「立即清理」并列的独立入口。
+            // 修剪的对象是进程而非系统内存列表，且忽略阈值与冷却
+            // （用户点了就是要立刻执行），因此不复用「立即清理」。
+            Button btnTrim = new Button();
+            btnTrim.Text = "修剪工作集";
+            btnTrim.Location = Pt(Margin_ + 272, y);
+            btnTrim.Size = Sz(88, 28);
+            btnTrim.Click += delegate { ManualTrim(); };
+            Controls.Add(btnTrim);
+            _btnTrim = btnTrim;
+
             Button btnSave = new Button();
             btnSave.Text = "保存";
-            btnSave.Location = Pt(FormW - Margin_ - 188, y);
-            btnSave.Size = Sz(88, 28);
+            btnSave.Location = Pt(FormW - Margin_ - 168, y);
+            btnSave.Size = Sz(76, 28);
             btnSave.Click += delegate { SaveAndClose(); };
             Controls.Add(btnSave);
 
             Button btnCancel = new Button();
             btnCancel.Text = "取消";
-            btnCancel.Location = Pt(FormW - Margin_ - 92, y);
-            btnCancel.Size = Sz(88, 28);
+            btnCancel.Location = Pt(FormW - Margin_ - 84, y);
+            btnCancel.Size = Sz(76, 28);
             btnCancel.Click += delegate { Close(); };
             Controls.Add(btnCancel);
         }
@@ -463,7 +619,28 @@ namespace MemReclaim
             _chkAutoStart.Checked = _config.AutoStart;
             _chkNotify.Checked = _config.ShowNotifications;
 
+            _chkTrim.Checked = _config.TrimWorkingSet;
+            _trimThreads.Value = Clamp(_config.TrimThreadCount, _trimThreads);
+            _trimThreshold.Value = Clamp(_config.TrimMemoryThresholdPercent, _trimThreshold);
+            _trimCooldown.Value = Clamp(_config.TrimCooldownSeconds, _trimCooldown);
+            _chkTrimBackground.Checked = _config.TrimBackgroundApps;
+            _chkTrimWindowsProc.Checked = _config.TrimWindowsProcesses;
+            RefreshTrimSummary();
+
             SyncEnabled();
+        }
+
+        /// <summary>刷新「工作集修剪」组里的统计标签：白名单与显式勾选数量。</summary>
+        private void RefreshTrimSummary()
+        {
+            if (_lblTrimSummary == null) return;
+
+            int whitelist = _config.GetWhitelistSet().Count;
+            int selected = _config.GetSelectedSet().Count;
+
+            // 紧凑写法：这段文字要和右侧按钮并排在 100px 出头的空间里，
+            // 写全「白名单 N 项，勾选 M 项」会被省略号截掉后半段。
+            _lblTrimSummary.Text = "白名单 " + whitelist + " · 勾选 " + selected;
         }
 
         private static decimal Clamp(int value, NumericUpDown ctl)
@@ -489,6 +666,32 @@ namespace MemReclaim
             _chkCombineThreshold.Enabled = _chkCombine.Checked;
             _combineMinutes.Enabled = _chkCombine.Checked && _chkCombineInterval.Checked;
             _combineThresholdPercent.Enabled = _chkCombine.Checked && _chkCombineThreshold.Checked;
+
+            // 工作集修剪：总开关关 → 其余参数不可用，避免用户以为改了就会生效
+            bool trim = _chkTrim.Checked;
+            _trimThreads.Enabled = trim;
+            _trimThreshold.Enabled = trim;
+            _trimCooldown.Enabled = trim;
+            _chkTrimBackground.Enabled = trim;
+            _chkTrimWindowsProc.Enabled = trim;
+            _btnProcessList.Enabled = true;   // 进程列表始终可打开，便于先看再决定
+        }
+
+        /// <summary>打开进程列表窗口。关闭后刷新统计行。</summary>
+        private void ShowProcessList()
+        {
+            using (ProcessListForm f = new ProcessListForm(_config, _engine))
+            {
+                f.ShowDialog(this);
+            }
+
+            // 进程列表窗口里同样可以切换「自动纳入后台应用 / Windows 应用」，
+            // 这里必须把值同步回本窗口的复选框。否则用户在那里改了开关，
+            // 回到设置窗口看到的还是旧勾选状态，一旦点「保存」就会用旧值
+            // 把刚改的配置覆盖回去——改动静默丢失，且很难察觉。
+            _chkTrimBackground.Checked = _config.TrimBackgroundApps;
+            _chkTrimWindowsProc.Checked = _config.TrimWindowsProcesses;
+            RefreshTrimSummary();
         }
 
         private void OnState(MemoryState st)
@@ -551,12 +754,13 @@ namespace MemReclaim
         /// <summary>本次异步操作的类型，决定结果如何展示。</summary>
         private enum PendingKind { None, Clean, Combine }
 
-        /// <summary>禁用三个操作按钮，避免清理进行中重复点击。</summary>
+        /// <summary>禁用操作按钮，避免清理进行中重复点击。</summary>
         private void SetButtonsEnabled(bool enabled)
         {
             if (_btnClean != null) _btnClean.Enabled = enabled;
             if (_btnCombine != null) _btnCombine.Enabled = enabled;
             if (_btnSelfTest != null) _btnSelfTest.Enabled = enabled;
+            if (_btnTrim != null) _btnTrim.Enabled = enabled;
             UseWaitCursor = !enabled;
         }
 
@@ -738,6 +942,100 @@ namespace MemReclaim
             }
         }
 
+        /// <summary>
+        /// 手动执行工作集修剪。
+        ///
+        /// 与自动触发的区别：
+        ///   - 忽略「内存占用超过 N%」门槛与冷却——用户点了就是要立刻执行；
+        ///   - 仍然尊重白名单与系统关键进程保护，这是安全底线，不因手动而放开。
+        ///
+        /// 严格异步：实际修剪在后台线程池里跑，这里立即返回，
+        /// 界面通过 Trimmed 事件回报。修剪数百个进程可能耗时数秒，
+        /// 同步执行会让窗口「未响应」。
+        /// </summary>
+        private void ManualTrim()
+        {
+            if (_engine.TrimRunning)
+            {
+                _logBox.Text = "已有一次修剪正在进行，请稍候再试。";
+                return;
+            }
+
+            _pendingTrim = true;
+            SetButtonsEnabled(false);
+            _logBox.Text = "正在修剪工作集…";
+
+            if (!_engine.TrimNowAsync())
+            {
+                _pendingTrim = false;
+                SetButtonsEnabled(true);
+                _logBox.Text = "已有一次修剪正在进行，请稍候再试。";
+            }
+        }
+
+        /// <summary>修剪完成回调。来自后台线程，需切回 UI。</summary>
+        private void OnTrimmed(TrimSummary sum)
+        {
+            if (IsDisposed) return;
+            try
+            {
+                if (InvokeRequired)
+                {
+                    BeginInvoke(new Action<TrimSummary>(OnTrimmed), sum);
+                    return;
+                }
+
+                SetButtonsEnabled(true);
+
+                if (_pendingTrim)
+                {
+                    _pendingTrim = false;
+
+                    StringBuilder sb = new StringBuilder();
+                    sb.AppendLine("手动工作集修剪");
+                    sb.AppendLine("时间：" + DateTime.Now.ToString("HH:mm:ss"));
+                    sb.AppendLine();
+                    sb.AppendLine(sum.ToString());
+
+                    // 只列失败项：成功的可能上百条，全列会淹没重点
+                    int shown = 0;
+                    foreach (ProcessEntry e in sum.Entries)
+                    {
+                        if (!e.TrimOk.HasValue || e.TrimOk.Value) continue;
+                        if (shown >= 8) { sb.AppendLine("…"); break; }
+                        sb.AppendLine("  失败：" + e.Name + " (" + e.Pid + ")");
+                        shown++;
+                    }
+
+                    _logBox.Text = sb.ToString();
+                }
+                else
+                {
+                    // 自动触发：只更新状态行，不打断用户
+                    _logBox.Text = sum.ToString();
+                }
+
+                RefreshStatus();
+            }
+            catch { }
+        }
+
+        /// <summary>修剪进度回调（来自工作线程）。</summary>
+        private void OnTrimProgress(int done, int total)
+        {
+            if (IsDisposed) return;
+            try
+            {
+                if (InvokeRequired)
+                {
+                    BeginInvoke(new Action<int, int>(OnTrimProgress), done, total);
+                    return;
+                }
+                _logBox.Text = "正在修剪工作集… " + done + " / " + total;
+            }
+            catch { }
+        }
+
         private void SaveAndClose()
         {
             _config.Mode = _modeThreshold.Checked ? TriggerMode.Threshold : TriggerMode.Interval;
@@ -757,6 +1055,14 @@ namespace MemReclaim
             _config.CombineMemoryThresholdPercent = (int)_combineThresholdPercent.Value;
 
             _config.ShowNotifications = _chkNotify.Checked;
+
+            // ---- 工作集修剪 ----
+            _config.TrimWorkingSet = _chkTrim.Checked;
+            _config.TrimThreadCount = (int)_trimThreads.Value;
+            _config.TrimMemoryThresholdPercent = (int)_trimThreshold.Value;
+            _config.TrimCooldownSeconds = (int)_trimCooldown.Value;
+            _config.TrimBackgroundApps = _chkTrimBackground.Checked;
+            _config.TrimWindowsProcesses = _chkTrimWindowsProc.Checked;
 
             // 开机自启：在启动文件夹（shell:startup）创建/删除指向本程序的快捷方式，
             // 不需要管理员权限，因此可以和其它设置一起在「保存」时统一生效。
@@ -790,6 +1096,8 @@ namespace MemReclaim
         {
             _engine.StateUpdated -= OnState;
             _engine.Cleaned -= OnCleaned;
+            _engine.Trimmed -= OnTrimmed;
+            _engine.TrimProgress -= OnTrimProgress;
             base.OnFormClosed(e);
         }
     }

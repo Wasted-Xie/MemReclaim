@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Text;
 using System.Threading;
@@ -89,6 +90,17 @@ namespace MemReclaim
             if (cfg.CleanLowPriorityStandbyList) log.AppendLine(MemoryCleaner.PurgeLowPriorityStandbyList().ToString());
             if (cfg.CleanSystemFileCache) log.AppendLine(MemoryCleaner.ClearSystemFileCache().ToString());
             if (cfg.CombineMemoryLists) log.AppendLine(MemoryCleaner.CombineMemoryLists().ToString());
+
+            // 工作集修剪与上面四项同层级，因此 --once 也应执行（当它被启用时）。
+            // 这里用同步版本：--once 本身就是一次性任务，没有界面需要保持响应，
+            // 同步执行反而能确保结果写进本次日志、退出码也反映真实情况。
+            if (cfg.TrimWorkingSet)
+            {
+                List<ProcessEntry> targets = WorkingSetTrimmer.SelectTargets(
+                    ProcessEnumerator.Enumerate(), cfg);
+                TrimSummary ts = WorkingSetTrimmer.Run(targets, cfg.TrimThreadCount, null);
+                log.AppendLine(ts.ToString());
+            }
 
             MemoryState after = MemoryStateReader.Read();
             AppendState(log, "清理后", after);

@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Text;
 using System.Xml.Serialization;
@@ -57,6 +58,132 @@ namespace MemReclaim
 
         /// <summary>合并的冷却时间（秒），防止阈值持续满足时连续执行。</summary>
         public int CombineCooldownSeconds = 300;
+
+        // ---- 工作集修剪（Working Set Trim）----
+        // 与上面四项清理同层级，但独立成一个列表：
+        // 上四项作用于系统级内存列表，修剪作用于具体进程，两者的触发语义与
+        // 风险面完全不同；混在同一个开关里会让用户无法只关其中一类。
+
+        /// <summary>是否启用工作集修剪。</summary>
+        public bool TrimWorkingSet = false;
+
+        /// <summary>
+        /// 修剪的并行线程数（1..32）。
+        ///
+        /// 默认 4。线程太少时进程多则线性耗时（200 个进程单线程约 4 秒）；
+        /// 太多则收益递减——EmptyWorkingSet 会争用内存管理器的锁，
+        /// 过度并发反而互相阻塞，还会和前台任务抢 CPU。
+        /// </summary>
+        public int TrimThreadCount = 4;
+
+        /// <summary>一键纳入：自动修剪所有「后台应用」（无可见窗口的普通进程）。</summary>
+        public bool TrimBackgroundApps = false;
+
+        /// <summary>
+        /// 一键纳入：自动修剪所有「Windows 进程」（svchost、conhost 等系统组件）。
+        ///
+        /// 注意：开启后会把系统组件纳入修剪范围，属于激进配置。
+        /// 仍受「系统保护」与「当前焦点跳过」两道保护约束，但 conhost、svchost
+        /// 这类进程被修剪后可能造成短暂卡顿，建议只在对内存极度敏感时开启。
+        /// </summary>
+        public bool TrimWindowsProcesses = false;
+
+        /// <summary>
+        /// 旧字段，仅用于从旧版配置迁移。
+        ///
+        /// 早期版本叫 TrimWindowsApps，表示「自动纳入 UWP 应用」；
+        /// 分类改为三类后该开关的语义调整为「自动纳入 Windows 进程」。
+        /// 保留此字段只为读出旧值，Load 之后会被清零，不再写回。
+        /// </summary>
+        [XmlElement("TrimWindowsApps")]
+        public bool LegacyTrimWindowsApps = false;
+
+        /// <summary>
+        /// 让旧字段只读不写：升级后保存配置时不应再写出 TrimWindowsApps，
+        /// 否则配置里会同时存在新旧两个开关，用户手动编辑时容易困惑。
+        /// </summary>
+        public bool ShouldSerializeLegacyTrimWindowsApps() { return false; }
+
+        /// <summary>
+        /// 自动修剪的触发门槛：内存占用超过该百分比才修剪。
+        ///
+        /// 默认 85（与合并的默认值一致）。内存充裕时修剪只是把页面推出去、
+        /// 进程马上又读回来，纯属制造缺页。手动修剪不受此限制。
+        /// </summary>
+        public int TrimMemoryThresholdPercent = 85;
+
+        /// <summary>两次自动修剪的最小间隔（秒）。默认 600，理由同主清理的冷却。</summary>
+        public int TrimCooldownSeconds = 600;
+
+        /// <summary>
+        /// 修剪时跳过「当前拥有输入焦点」的应用（默认开启）。
+        ///
+        /// 与「前台应用」分类是两个概念：
+        ///   - 分类看有没有可见窗口（任务管理器口径，包含被遮挡、最小化的窗口）；
+        ///   - 本开关看的是真正的输入焦点，只保护用户此刻正在操作的那一个。
+        /// 关掉它意味着正在打字的程序也可能被修剪，会明显卡顿，一般不要关。
+        /// </summary>
+        public bool TrimSkipForeground = true;
+
+        /// <summary>
+        /// 白名单（进程名，可带或不带 .exe）。白名单中的进程即使被一键纳入也永不修剪。
+        ///
+        /// 用 string[] 而不是 List&lt;string&gt;：XmlSerializer 对数组的行为更稳定
+        /// （空数组落成 &lt;TrimWhitelist /&gt;，List 可能落成 null），
+        /// 而这份配置是要给人看、也可能被手改的。
+        /// </summary>
+        public string[] TrimWhitelist = new string[0];
+
+        /// <summary>
+        /// 显式勾选的进程（进程名，不带 .exe，大小写不敏感）。
+        ///
+        /// 按名称而不是 PID 保存：PID 每次开机都变，存 PID 等于勾选只对本次会话
+        /// 有效，用户会以为设置丢了。按名称保存的副作用是同名的多个实例
+        /// （如多个 chrome.exe）会一起被选中——对内存修剪来说这正是期望行为。
+        /// </summary>
+        public string[] TrimSelectedNames = new string[0];
+
+        /// <summary>白名单的快速查找集合（大小写不敏感，已去 .exe）。</summary>
+        public HashSet<string> GetWhitelistSet()
+        {
+            return ToNameSet(TrimWhitelist);
+        }
+
+        /// <summary>显式勾选的快速查找集合。</summary>
+        public HashSet<string> GetSelectedSet()
+        {
+            return ToNameSet(TrimSelectedNames);
+        }
+
+        private static HashSet<string> ToNameSet(string[] source)
+        {
+            HashSet<string> set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (source != null)
+            {
+                foreach (string s in source)
+                {
+                    if (string.IsNullOrEmpty(s)) continue;
+
+                    // 注意要先 Trim 再判空：配置里可能残留 "  " 这种纯空白项，
+                    // 若直接 StripExe 会得到空串并混进集合，最终落盘成一个
+                    // 看不见的空条目。
+                    string t = ProcessEnumerator.StripExe(s.Trim());
+                    if (t.Length == 0) continue;
+
+                    set.Add(t);
+                }
+            }
+            return set;
+        }
+
+        /// <summary>把集合写回数组（排序后保存，便于人工核对配置）。</summary>
+        public static string[] FromNameSet(HashSet<string> set)
+        {
+            if (set == null || set.Count == 0) return new string[0];
+            List<string> list = new List<string>(set);
+            list.Sort(StringComparer.OrdinalIgnoreCase);
+            return list.ToArray();
+        }
 
         // ---- 其它 ----
         public bool AutoStart = false;
@@ -174,6 +301,28 @@ namespace MemReclaim
             if (CombineCooldownSeconds < 0) CombineCooldownSeconds = 0;
             if (CombineCooldownSeconds > 86400) CombineCooldownSeconds = 86400;
 
+            // 工作集修剪：线程数必须落在可用区间。上限 32 不是随意取的——
+            // 再高就会淹没在内存管理器的锁竞争里，实测无收益。
+            if (TrimThreadCount < 1) TrimThreadCount = 1;
+            if (TrimThreadCount > 32) TrimThreadCount = 32;
+
+            if (TrimMemoryThresholdPercent < 1) TrimMemoryThresholdPercent = 1;
+            if (TrimMemoryThresholdPercent > 99) TrimMemoryThresholdPercent = 99;
+
+            if (TrimCooldownSeconds < 0) TrimCooldownSeconds = 0;
+            if (TrimCooldownSeconds > 86400) TrimCooldownSeconds = 86400;
+
+            // 白名单/勾选列表清洗：去掉空白项与末尾 .exe，避免存进配置后比对不上。
+            TrimWhitelist = FromNameSet(ToNameSet(TrimWhitelist));
+            TrimSelectedNames = FromNameSet(ToNameSet(TrimSelectedNames));
+
+            // 兼容旧配置：旧版 TrimWindowsApps 表示「自动纳入 UWP」，
+            // 现已改为「自动纳入 Windows 进程」。旧值 true 时延续开启意图，
+            // 然后清零，避免下次保存又写回旧字段。
+            if (LegacyTrimWindowsApps && !TrimWindowsProcesses)
+                TrimWindowsProcesses = true;
+            LegacyTrimWindowsApps = false;
+
             // 兼容旧配置：早先版本用 CombineIntervalMinutes = 0 表示「随主清理一起执行」，
             // 且没有独立开关。此时若两个开关都关着，合并将永不被自动触发，
             // 与用户原本的预期不符，故按阈值方式启用一次，交由冷却控制频率。
@@ -210,6 +359,14 @@ namespace MemReclaim
                 combineMode = cm.ToString();
             }
             sb.AppendLine("  合并内存列表            " + combineMode);
+            sb.AppendLine("工作集修剪：");
+            sb.AppendLine("  总开关                  " + (TrimWorkingSet ? "开（线程 " + TrimThreadCount + "）" : "关"));
+            sb.AppendLine("  自动纳入后台应用        " + (TrimBackgroundApps ? "开" : "关"));
+            sb.AppendLine("  自动纳入 Windows 进程   " + (TrimWindowsProcesses ? "开" : "关"));
+            sb.AppendLine("  白名单                  " +
+                (TrimWhitelist != null && TrimWhitelist.Length > 0
+                    ? TrimWhitelist.Length + " 项：" + string.Join(", ", TrimWhitelist)
+                    : "无"));
             return sb.ToString();
         }
     }

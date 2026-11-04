@@ -88,6 +88,13 @@ namespace MemReclaim
             log.AppendLine("  合并内存列表            " + Mark(r4.Success) + " " + r4.Message);
             log.AppendLine();
 
+            // 工作集修剪单独统计：它不是系统内存列表操作，不需要上面两项特权，
+            // 失败原因也完全不同（通常是目标进程受保护、拒绝 OpenProcess），
+            // 与清理项混在一起统计会误导排查方向。
+            log.AppendLine("—— 工作集修剪 ——");
+            int trimFail = TrimProbe(log);
+            log.AppendLine();
+
             MemoryState st = MemoryStateReader.Read();
             if (st.Valid)
             {
@@ -101,7 +108,8 @@ namespace MemReclaim
             }
 
             int failed = (r1.Success ? 0 : 1) + (r2.Success ? 0 : 1) +
-                         (r3.Success ? 0 : 1) + (r4.Success ? 0 : 1);
+                         (r3.Success ? 0 : 1) + (r4.Success ? 0 : 1) + trimFail;
+
             if (failed > 0)
             {
                 log.AppendLine("—— 失败项说明 ——");
@@ -116,6 +124,14 @@ namespace MemReclaim
                 if (advice != null) log.AppendLine(advice);
             }
 
+            if (trimFail > 0)
+            {
+                log.AppendLine("—— 工作集修剪失败说明 ——");
+                log.AppendLine("  修剪不需要额外特权（只用到 OpenProcess + EmptyWorkingSet），");
+                log.AppendLine("  因此失败通常不是权限问题，而是接口本身被拦截或进程枚举受限。");
+                log.AppendLine();
+            }
+
             string text = log.ToString();
             // 走 ConsoleOut 而不是直接 Console.Write：
             // 托盘版（winexe）没有控制台，直接写会抛 IOException 让进程崩溃。
@@ -128,6 +144,58 @@ namespace MemReclaim
             catch { }
 
             return failed == 0 ? 0 : 2;
+        }
+
+        /// <summary>
+        /// 工作集修剪可用性探针。
+        ///
+        /// 只修剪**本进程自身**：EmptyWorkingSet 对自己始终有权，
+        /// 因此能干净地区分「接口本身不可用」与「目标进程拒绝访问」两种情况。
+        /// 不拿别人的进程做测试——自检不该产生副作用。
+        ///
+        /// 返回失败项数。
+        /// </summary>
+        private static int TrimProbe(StringBuilder log)
+        {
+            int fail = 0;
+
+            // 进程枚举能力（列表窗口依赖它）
+            int count;
+            try
+            {
+                count = ProcessEnumerator.Enumerate().Count;
+                log.AppendLine("  进程枚举                [可用] 枚举到 " + count + " 个进程");
+            }
+            catch (Exception ex)
+            {
+                log.AppendLine("  进程枚举                [失败] " + ex.Message);
+                count = 0;
+                fail++;
+            }
+
+            // EmptyWorkingSet 自身可用性
+            IntPtr self = Native.GetCurrentProcess();
+            bool ok = false;
+            string detail;
+            try
+            {
+                ok = Native.EmptyWorkingSet(self);
+                if (ok) detail = "成功";
+                else detail = Native.Win32ToText(System.Runtime.InteropServices.Marshal.GetLastWin32Error());
+            }
+            catch (Exception ex)
+            {
+                detail = ex.Message;
+            }
+
+            if (!ok) fail++;
+            log.AppendLine("  EmptyWorkingSet（自检用自身进程） " + Mark(ok) + " " + detail);
+
+            // 说明：这里不检测「能否修剪其他用户/受保护进程」，
+            // 那取决于目标进程的 ACL，逐进程结果会在修剪结果里如实列出。
+            log.AppendLine("     （其他进程能否修剪取决于其访问权限，逐进程结果见修剪执行报告）");
+
+            return fail;
         }
 
         private static string Mark(bool ok) { return ok ? "[可用]" : "[失败]"; }

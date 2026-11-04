@@ -57,6 +57,13 @@ namespace MemReclaim
             cleanItem.Click += delegate { ManualClean(); };
             menu.Items.Add(cleanItem);
 
+            // 工作集修剪：与「立即清理」并列的独立入口。
+            // 修剪作用于进程工作集，与上面四项系统级清理是不同性质的操作，
+            // 且开销随进程数增长，故单独成项而不是并进「立即清理」。
+            ToolStripMenuItem trimItem = new ToolStripMenuItem("修剪工作集");
+            trimItem.Click += delegate { ManualTrim(); };
+            menu.Items.Add(trimItem);
+
             _autoItem = new ToolStripMenuItem("启用自动清理");
             _autoItem.CheckOnClick = true;
             _autoItem.Checked = true;
@@ -293,6 +300,32 @@ namespace MemReclaim
             {
                 _showResultDialog = false;
                 MessageBox.Show("上一次清理仍在进行中，请稍候再试。",
+                    "内存回收", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+        }
+
+        /// <summary>
+        /// 托盘菜单「修剪工作集」。
+        ///
+        /// 与「立即清理」分开：修剪的对象是各进程的工作集，不是系统内存列表。
+        /// 这里忽略阈值与冷却（用户点了就是要立刻执行），但仍尊重白名单与
+        /// 系统关键进程保护——那是安全底线，不因手动而放开。
+        ///
+        /// 严格异步：实际修剪在后台线程池执行，这里立即返回。
+        /// 修剪上百个进程可能耗时数百毫秒到数秒，同步执行会冻住托盘菜单。
+        /// </summary>
+        private void ManualTrim()
+        {
+            if (_engine.TrimRunning)
+            {
+                MessageBox.Show("已有一次修剪正在进行，请稍候再试。",
+                    "内存回收", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            if (!_engine.TrimNowAsync())
+            {
+                MessageBox.Show("已有一次修剪正在进行，请稍候再试。",
                     "内存回收", MessageBoxButtons.OK, MessageBoxIcon.Information);
             }
         }

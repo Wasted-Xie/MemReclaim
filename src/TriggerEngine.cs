@@ -21,10 +21,18 @@ namespace MemReclaim
 
         private DateTime _lastClean = DateTime.MinValue;
         private DateTime _lastCombine = DateTime.MinValue;
+        private DateTime _lastTrim = DateTime.MinValue;
         private bool _busy;
+        private int _trimRunning;   // 0=空闲 1=运行中，用 Interlocked 访问
 
         /// <summary>一次清理完成后回调（用于界面显示与通知）。</summary>
         public event Action<List<CleanResult>> Cleaned;
+
+        /// <summary>一次工作集修剪完成后回调。回调来自后台线程。</summary>
+        public event Action<TrimSummary> Trimmed;
+
+        /// <summary>修剪进度回调（已完成数, 总数）。来自工作线程。</summary>
+        public event Action<int, int> TrimProgress;
 
         /// <summary>清理前的内存状态快照（供界面刷新）。</summary>
         public event Action<MemoryState> StateUpdated;
@@ -36,6 +44,10 @@ namespace MemReclaim
 
         public DateTime LastCleanTime { get { lock (_sync) return _lastClean; } }
         public DateTime LastCombineTime { get { lock (_sync) return _lastCombine; } }
+        public DateTime LastTrimTime { get { lock (_sync) return _lastTrim; } }
+
+        /// <summary>当前是否有修剪正在进行。</summary>
+        public bool TrimRunning { get { return Interlocked.CompareExchange(ref _trimRunning, 1, 1) == 1; } }
 
         public void Start()
         {
@@ -80,6 +92,9 @@ namespace MemReclaim
                 else shouldClean = EvaluateInterval();
 
                 if (shouldClean) RunClean();
+
+                // ---- 工作集修剪：只在真需要时启动，且立即返回（异步）----
+                MaybeStartTrim(st);
             }
             catch
             {
@@ -89,6 +104,113 @@ namespace MemReclaim
             {
                 lock (_sync) _busy = false;
             }
+        }
+
+        /// <summary>
+        /// 自动触发工作集修剪。
+        ///
+        /// 【为什么与主清理分开调度】
+        /// 修剪要枚举全部进程再逐个开句柄，耗时可达成百毫秒到数秒，
+        /// 而且它本来就是多线程并行的。若塞进 RunClean 的同步链路里，
+        /// 会把整个 tick 拖长，阈值判断的实时性和界面刷新都会受影响。
+        /// 因此这里只做「是否该修剪」的判断，真正的执行交给
+        /// WorkingSetTrimmer.RunAsync，在独立后台线程跑，本方法立即返回。
+        ///
+        /// 冷却用意与其它项一致：频繁把进程工作集推出物理内存，会让它们
+        /// 立刻又缺页读回，形成抖动，净收益为负。
+        /// </summary>
+        private void MaybeStartTrim(MemoryState st)
+        {
+            if (!_config.TrimWorkingSet) return;
+
+            lock (_sync)
+            {
+                if (_config.TrimCooldownSeconds > 0 &&
+                    (DateTime.Now - _lastTrim).TotalSeconds < _config.TrimCooldownSeconds)
+                    return;
+            }
+
+            // 只在内存确实紧张时自动修剪；内存充裕时修剪纯属制造缺页。
+            // 手动修剪不受此限制（用户点了就是要执行）。
+            double usedPercent = 100.0 - st.AvailablePercent;
+            if (usedPercent < _config.TrimMemoryThresholdPercent) return;
+
+            TrimNowAsync();
+        }
+
+        /// <summary>
+        /// 异步执行一次工作集修剪。立即返回；结果通过 Trimmed 事件回报。
+        ///
+        /// 返回 false 表示已有一次修剪在进行中，本次被忽略。
+        ///
+        /// 注意这里**不占用 _busy**：修剪与主清理互不阻塞。两者操作的对象不同
+        /// （一个是系统内存列表，一个是进程工作集），并发执行不会互相破坏；
+        /// 而如果共用一把锁，修剪进行时用户点「立即清理」就会被无故拒绝。
+        /// </summary>
+        public bool TrimNowAsync()
+        {
+            if (Interlocked.CompareExchange(ref _trimRunning, 1, 0) != 0) return false;
+
+            Action<int, int> progress = TrimProgress;
+
+            WorkingSetTrimmer.RunAsync(_config, delegate (TrimSummary sum)
+            {
+                try
+                {
+                    lock (_sync) _lastTrim = DateTime.Now;
+
+                    Action<TrimSummary> h = Trimmed;
+                    if (h != null) h(sum);
+                }
+                catch { }
+                finally
+                {
+                    Interlocked.Exchange(ref _trimRunning, 0);
+                }
+            }, progress == null ? null : new Action<int, int>(delegate (int done, int total)
+            {
+                try { progress(done, total); } catch { }
+            }));
+
+            return true;
+        }
+
+        /// <summary>手动修剪指定进程（进程列表里「立即修剪选中」用）。</summary>
+        public bool TrimProcessesAsync(List<ProcessEntry> targets)
+        {
+            if (targets == null || targets.Count == 0) return false;
+            if (Interlocked.CompareExchange(ref _trimRunning, 1, 0) != 0) return false;
+
+            int threadCount = _config.TrimThreadCount;
+
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                TrimSummary sum;
+                try
+                {
+                    sum = WorkingSetTrimmer.Run(targets, threadCount, null);
+                }
+                catch (Exception ex)
+                {
+                    sum = new TrimSummary();
+                    sum.Failed = 1;
+                    sum.Description = "工作集修剪异常：" + ex.Message;
+                }
+
+                try
+                {
+                    lock (_sync) _lastTrim = DateTime.Now;
+                    Action<TrimSummary> h = Trimmed;
+                    if (h != null) h(sum);
+                }
+                catch { }
+                finally
+                {
+                    Interlocked.Exchange(ref _trimRunning, 0);
+                }
+            });
+
+            return true;
         }
 
         /// <summary>
