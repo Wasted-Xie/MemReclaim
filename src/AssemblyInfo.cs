@@ -15,15 +15,15 @@ using System.Runtime.InteropServices;
 //   AssemblyInformationalVersion —— 展示用，可含预发布标识
 
 [assembly: AssemblyTitle("内存回收 (MemReclaim)")]
-[assembly: AssemblyDescription("实时回收待机列表、待机列表（无优先级）、系统文件缓存，并定时合并内存列表")]
+[assembly: AssemblyDescription("实时回收待机列表、待机列表（无优先级）、系统文件缓存，定时合并内存列表，并按策略并行修剪进程工作集")]
 [assembly: AssemblyProduct("MemReclaim")]
 [assembly: AssemblyCompany("Wasted-Xie")]
 [assembly: AssemblyCopyright("Copyright (c) 2026 Wasted-Xie")]
 [assembly: AssemblyConfiguration("Release")]
 
-[assembly: AssemblyVersion("0.1.0.0")]
-[assembly: AssemblyFileVersion("0.1.0.0")]
-[assembly: AssemblyInformationalVersion("0.1.0")]
+[assembly: AssemblyVersion("0.2.0.0")]
+[assembly: AssemblyFileVersion("0.2.0.0")]
+[assembly: AssemblyInformationalVersion("0.2.0")]
 
 // 本程序不使用 COM，明确声明以便 CLR 跳过相关探测
 [assembly: ComVisible(false)]
